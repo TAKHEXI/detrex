@@ -1,17 +1,29 @@
 from detrex.config import get_config
-from .models.dab_detr_r50 import model
-import torch
+from .models.dab_deformable_detr_r50 import model
 
-torch.cuda.set_device(4)
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+import torch
+torch.cuda.set_device(1)
 torch.cuda.empty_cache()
-dataloader = get_config("common/data/coco_detr.py").dataloader
+
+
+dataloader = get_config("common/data/voc_detr.py").dataloader
+# dataloader = get_config("common/data/coco_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
 lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_50ep
 train = get_config("common/train.py").train
 
-# initialize checkpoint to be loaded
+# modify training config
+# train.init_checkpoint = "/home/xyyu/projects/detrex/dab_deformable_detr_r50_50ep_49AP.pth"
+# train.init_checkpoint = "/home/xyyu/projects/detrex/output/dab_deformable_detr_r50_50ep_coco_vehicle/model_0374999.pth"
+# train.output_dir = "./output/dab_deformable_detr_r50_50ep_coco_vehicle_3579"
 train.init_checkpoint = "detectron2://ImageNetPretrained/torchvision/R-50.pkl"
-train.output_dir = "./output/dab_detr_r50_50ep"
+train.output_dir = "./output/exp_0801"
+
+# set training seed
+train.seed = 42
 
 # max training iterations
 train.max_iter = 375000
@@ -32,6 +44,7 @@ train.clip_grad.params.norm_type = 2
 
 # set training devices
 train.device = "cuda"
+# train.device = "cpu"
 model.device = train.device
 
 # modify optimizer config
@@ -41,12 +54,12 @@ optimizer.weight_decay = 1e-4
 # optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
-dataloader.train.num_workers = 16
+dataloader.train.num_workers = 2
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
-dataloader.train.total_batch_size = 16
+dataloader.train.total_batch_size = 2
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir

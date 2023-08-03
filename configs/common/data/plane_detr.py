@@ -8,13 +8,18 @@ from detectron2.data import (
     get_detection_dataset_dicts,
 )
 from detectron2.evaluation import COCOEvaluator
-
+from detectron2.data.datasets import register_coco_instances
 from detrex.data import DetrDatasetMapper
+
+
+register_coco_instances("plane_train", {}, "/home/xyyu/datasets/aeroplane/annotations/plane_split_1_train.json", "/home/xyyu/datasets/aeroplane/train")
+register_coco_instances("plane_val", {}, "/home/xyyu/datasets/aeroplane/annotations/plane_split_1_val.json", "/home/xyyu/datasets/aeroplane/val")
+
 
 dataloader = OmegaConf.create()
 
 dataloader.train = L(build_detection_train_loader)(
-    dataset=L(get_detection_dataset_dicts)(names="coco_2014_train"),
+    dataset=L(get_detection_dataset_dicts)(names="plane_train"),
     mapper=L(DetrDatasetMapper)(
         augmentation=[
             L(T.RandomFlip)(),
@@ -49,7 +54,7 @@ dataloader.train = L(build_detection_train_loader)(
 )
 
 dataloader.test = L(build_detection_test_loader)(
-    dataset=L(get_detection_dataset_dicts)(names="coco_2014_val", filter_empty=False),
+    dataset=L(get_detection_dataset_dicts)(names="plane_val", filter_empty=False),
     mapper=L(DetrDatasetMapper)(
         augmentation=[
             L(T.ResizeShortestEdge)(

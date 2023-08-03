@@ -15,11 +15,16 @@
 
 
 import copy
+import json
+
 import math
 from typing import List
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
 from detrex.layers import MLP, box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 from detrex.utils import inverse_sigmoid
@@ -27,6 +32,7 @@ from detrex.utils import inverse_sigmoid
 from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
 
+import cv2
 
 class DabDeformableDETR(nn.Module):
     """Implement DAB-Deformable-DETR in `DAB-DETR: Dynamic Anchor Boxes are Better Queries for DETR
@@ -83,8 +89,8 @@ class DabDeformableDETR(nn.Module):
         # tgt embedings corresponding to content queries in original paper.
         self.num_queries = num_queries
         if not as_two_stage:
-            self.tgt_embed = nn.Embedding(num_queries, embed_dim)
-            self.refpoint_embed = nn.Embedding(num_queries, 4)
+            self.tgt_embed = nn.Embedding(num_queries, embed_dim)   # (300, 256)
+            self.refpoint_embed = nn.Embedding(num_queries, 4)      # (300, 4)
             # initialize learnable anchor boxes
             nn.init.zeros_(self.tgt_embed.weight)
             nn.init.uniform_(self.refpoint_embed.weight)
@@ -119,23 +125,28 @@ class DabDeformableDETR(nn.Module):
                 nn.init.constant_(neck_layer.bias, 0)
 
         # if two-stage, the last class_embed and bbox_embed is for region proposal generation
-        num_pred = (
-            (transformer.decoder.num_layers + 1) if as_two_stage else transformer.decoder.num_layers
-        )
+        # num_pred = (
+        #     (transformer.decoder.num_layers + 1) if as_two_stage else transformer.decoder.num_layers
+        # )
+        num_pred = (transformer.decoder.num_layers + 1)
+
         self.class_embed = nn.ModuleList([copy.deepcopy(self.class_embed) for i in range(num_pred)])
         self.bbox_embed = nn.ModuleList([copy.deepcopy(self.bbox_embed) for i in range(num_pred)])
         nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
 
         # hack implementation for two-stage
-        if self.as_two_stage:
-            self.transformer.decoder.class_embed = self.class_embed
+        # if self.as_two_stage:
+        #     self.transformer.decoder.class_embed = self.class_embed
+        self.transformer.decoder.class_embed = self.class_embed
 
         # hack implementation for iterative bounding box refinement and two-stage.
         # The last class_embed and bbox_embed is for region proposal generation
         self.transformer.decoder.bbox_embed = self.bbox_embed
-        if self.as_two_stage:
-            for bbox_embed_layer in self.bbox_embed:
-                nn.init.constant_(bbox_embed_layer.layers[-1].bias.data[2:], 0.0)
+        # if self.as_two_stage:
+        #     for bbox_embed_layer in self.bbox_embed:
+        #         nn.init.constant_(bbox_embed_layer.layers[-1].bias.data[2:], 0.0)
+        for bbox_embed_layer in self.bbox_embed:
+            nn.init.constant_(bbox_embed_layer.layers[-1].bias.data[2:], 0.0)
 
         # set topk boxes selected for inference
         self.select_box_nums_for_evaluation = select_box_nums_for_evaluation
@@ -184,6 +195,11 @@ class DabDeformableDETR(nn.Module):
             batch_size, _, H, W = images.tensor.shape
             img_masks = images.tensor.new_zeros(batch_size, H, W)
 
+        WH = []
+        for b in range(batch_size):
+            wh = [W, H, W, H]
+            WH.append(wh)
+
         # original features
         features = self.backbone(images.tensor)  # output feature dict
 
@@ -212,30 +228,31 @@ class DabDeformableDETR(nn.Module):
             inter_references,
             enc_state,
             enc_reference,  # [0..1]
+            reference_points_2stage,         # encoder 的输出的预测 proposal (bs, 300, 4)
         ) = self.transformer(
-            multi_level_feats, multi_level_masks, multi_level_position_embeddings, query_embeds
+            multi_level_feats, multi_level_masks, multi_level_position_embeddings, query_embeds, WH
         )
 
         # Calculate output coordinates and classes.
-        outputs_classes = []
-        outputs_coords = []
-        for lvl in range(inter_states.shape[0]):
+        outputs_classes = []                            # 存放分类结果
+        outputs_coords = []                             # 存放box结果
+        for lvl in range(inter_states.shape[0]):        # 6 层
             if lvl == 0:
-                reference = init_reference
+                reference = init_reference              # 初始化
             else:
                 reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
-            outputs_class = self.class_embed[lvl](inter_states[lvl])
+            reference = inverse_sigmoid(reference)      # 反归一化
+            outputs_class = self.class_embed[lvl](inter_states[lvl]) # 6个分类头，各自预测各自的 torch.Size([1, 300, 4])
             tmp = self.bbox_embed[lvl](inter_states[lvl])
             if reference.shape[-1] == 4:
-                tmp += reference
+                tmp += reference                        # 预测出box结果加上reference，默认为4
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
-            outputs_coord = tmp.sigmoid()
+            outputs_coord = tmp.sigmoid()               # 获取输出box结果并进行归一化
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
-        outputs_class = torch.stack(outputs_classes)
+        outputs_class = torch.stack(outputs_classes)    # 输出结果
         # tensor shape: [num_decoder_layers, bs, num_query, num_classes]
         outputs_coord = torch.stack(outputs_coords)
         # tensor shape: [num_decoder_layers, bs, num_query, 4]
@@ -252,8 +269,65 @@ class DabDeformableDETR(nn.Module):
             output["enc_outputs"] = {"pred_logits": interm_class, "pred_boxes": interm_coord}
 
         if self.training:
+            predict_bbox = reference_points_2stage
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets = self.prepare_targets(gt_instances)
+
+            # unknown_label = self.num_classes
+            unknown_label = 0
+            for i, target in enumerate(targets):
+                wh = [W, H]
+
+                f = open("./record.json", "r")
+                load_img = np.array(json.load(f)["image-ts"])
+                load_img = np.ascontiguousarray(load_img, dtype=np.uint8)
+
+                unknown_targets = {"labels": [], "boxes": []}
+                t_box = target["boxes"]
+                p_box = predict_bbox[i]
+                for p in p_box:
+                    flag = True
+                    for t in t_box:
+                        p_box_xyxy = box_cxcywh_to_xyxy(p).cpu().numpy()
+                        p_x1y1 = [x * y for x, y in zip(p_box_xyxy[:2], wh)]
+                        p_x2y2 = [x * y for x, y in zip(p_box_xyxy[2:], wh)]
+
+                        t_box_xyxy = box_cxcywh_to_xyxy(t).cpu().numpy()
+                        t_x1y1 = [x * y for x, y in zip(t_box_xyxy[:2], wh)]
+                        t_x2y2 = [x * y for x, y in zip(t_box_xyxy[2:], wh)]
+
+                        xy_max = np.minimum(t_x2y2, p_x2y2)
+                        xy_min = np.maximum(t_x1y1, p_x1y1)
+                        inter = np.clip(xy_max - xy_min, a_min=0, a_max=np.inf)
+                        inter = inter[0] * inter[1]
+                        area_t = (t_x2y2[0] - t_x1y1[0]) * (t_x2y2[1] - t_x1y1[1])
+                        area_p = (p_x2y2[0] - p_x1y1[0]) * (p_x2y2[1] - p_x1y1[1])
+                        union = area_t + area_p - inter
+                        iou = inter / union
+                        if iou > 0.005 :
+                            flag = False
+                    if flag:
+                        unknown_targets["labels"].append(unknown_label)
+                        unknown_targets["boxes"].append(p.cpu().numpy())
+                        product1 = [x * y for x, y in zip(p_box_xyxy[:2], wh)]
+                        product2 = [x * y for x, y in zip(p_box_xyxy[2:], wh)]
+                        cv2.rectangle(load_img, np.array(product1).astype(int), np.array(product2).astype(int),
+                                      (255, 0, 0), 5)
+                unknown_lab = torch.from_numpy(np.array(unknown_targets["labels"])).to(self.device)
+                unknown_box = torch.from_numpy(np.array(unknown_targets["boxes"])).to(self.device)
+                target["labels"] = torch.cat((target["labels"], unknown_lab), dim=0)
+                target["boxes"] = torch.cat((target["boxes"], unknown_box), dim=0)
+                targets[i] = target
+
+                for t in t_box:
+                    t_box_xyxy = box_cxcywh_to_xyxy(t).cpu().numpy()
+                    product1 = [x * y for x, y in zip(t_box_xyxy[:2], wh)]
+                    product2 = [x * y for x, y in zip(t_box_xyxy[2:], wh)]
+                    cv2.rectangle(load_img, np.array(product1).astype(int), np.array(product2).astype(int), (0, 0, 255),
+                                  5)
+                cv2.imwrite("./out_img.jpg", load_img)
+                f.close()
+
             loss_dict = self.criterion(output, targets)
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():

@@ -1,17 +1,21 @@
 from detrex.config import get_config
-from .models.dab_detr_r50 import model
+from .models.dab_deformable_detr_r50 import model
 import torch
 
 torch.cuda.set_device(4)
-torch.cuda.empty_cache()
-dataloader = get_config("common/data/coco_detr.py").dataloader
+
+dataloader = get_config("common/data/plane_detr.py").dataloader
+# dataloader = get_config("common/data/coco_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
 lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_50ep
 train = get_config("common/train.py").train
 
-# initialize checkpoint to be loaded
-train.init_checkpoint = "detectron2://ImageNetPretrained/torchvision/R-50.pkl"
-train.output_dir = "./output/dab_detr_r50_50ep"
+# modify training config
+train.init_checkpoint = "./dab_deformable_detr_r50_50ep_49AP.pth"
+train.output_dir = "./output/dab_deformable_detr_r50_50ep_plane_test"
+
+# set training seed
+train.seed = 42
 
 # max training iterations
 train.max_iter = 375000
@@ -41,12 +45,12 @@ optimizer.weight_decay = 1e-4
 # optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
-dataloader.train.num_workers = 16
+dataloader.train.num_workers = 2
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
-dataloader.train.total_batch_size = 16
+dataloader.train.total_batch_size = 2
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir

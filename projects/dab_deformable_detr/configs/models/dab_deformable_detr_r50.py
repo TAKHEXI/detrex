@@ -73,12 +73,12 @@ model = L(DabDeformableDETR)(
         two_stage_num_proposals="${..num_queries}",
     ),
     embed_dim=256,
-    num_classes=80,
+    num_classes=5,
     num_queries=300,
     aux_loss=True,
     as_two_stage=False,
     criterion=L(TwoStageCriterion)(
-        num_classes=80,
+        num_classes=5,
         matcher=L(HungarianMatcher)(
             cost_class=2.0,
             cost_bbox=5.0,

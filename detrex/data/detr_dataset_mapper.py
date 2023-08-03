@@ -21,12 +21,14 @@
 # ------------------------------------------------------------------------------------------------
 
 import copy
+import json
 import logging
 import numpy as np
 import torch
 
 from detectron2.data import detection_utils as utils
 from detectron2.data import transforms as T
+import cv2
 
 __all__ = ["DetrDatasetMapper"]
 
@@ -122,4 +124,11 @@ class DetrDatasetMapper:
             ]
             instances = utils.annotations_to_instances(annos, image_shape)
             dataset_dict["instances"] = utils.filter_empty_instances(instances)
+
+            # draw_img = cv2.rectangle(image, annos[0]["bbox"].astype(int)[:2], annos[0]["bbox"].astype(int)[2:], (0, 0, 255), 5)
+            # cv2.imwrite("./draw.jpg", draw_img)
+
+        # js = {"image-ts": image.tolist()}
+        # with open("./record.json", "w") as f:
+        #     json.dump(js, f)
         return dataset_dict

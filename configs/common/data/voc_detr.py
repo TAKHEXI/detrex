@@ -6,15 +6,23 @@ from detectron2.data import (
     build_detection_test_loader,
     build_detection_train_loader,
     get_detection_dataset_dicts,
+    # MetadataCatalog
 )
 from detectron2.evaluation import COCOEvaluator
-
+from detectron2.data.datasets import register_coco_instances
 from detrex.data import DetrDatasetMapper
+
+
+register_coco_instances("coco_vehicle_train", {}, "/home/xyyu/datasets/coco/annotations/instances_train2014(vehicle-base).json", "/home/xyyu/datasets/coco/train2014")
+register_coco_instances("coco_vehicle_val", {}, "/home/xyyu/datasets/coco/annotations/instances_val2014(vehicle-base).json", "/home/xyyu/datasets/coco/val2014")
+# register_coco_instances("coco_vehicle_test", {}, "/home/xyyu/datasets/coco/annotations/image_info_test2014.json", "/home/xyyu/datasets/coco/test2014")
+# MetadataCatalog.get("coco_vehicle_train").thing_classes=["bicyle", "motorcycle", "bus", "truck"]
+# MetadataCatalog.get("coco_vehicle_val").thing_classes=["bicyle", "motorcycle", "bus", "truck"]
 
 dataloader = OmegaConf.create()
 
 dataloader.train = L(build_detection_train_loader)(
-    dataset=L(get_detection_dataset_dicts)(names="coco_2014_train"),
+    dataset=L(get_detection_dataset_dicts)(names="coco_vehicle_train"),
     mapper=L(DetrDatasetMapper)(
         augmentation=[
             L(T.RandomFlip)(),
@@ -49,7 +57,8 @@ dataloader.train = L(build_detection_train_loader)(
 )
 
 dataloader.test = L(build_detection_test_loader)(
-    dataset=L(get_detection_dataset_dicts)(names="coco_2014_val", filter_empty=False),
+    dataset=L(get_detection_dataset_dicts)(names="coco_vehicle_val", filter_empty=False),
+    # dataset=L(get_detection_dataset_dicts)(names="coco_vehicle_test", filter_empty=False),
     mapper=L(DetrDatasetMapper)(
         augmentation=[
             L(T.ResizeShortestEdge)(

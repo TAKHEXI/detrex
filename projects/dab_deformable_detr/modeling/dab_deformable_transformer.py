@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import numpy as np
 import torch
 import torch.nn as nn
+import torchvision
 
 from detrex.layers import (
     FFN,
@@ -26,7 +27,7 @@ from detrex.layers import (
     get_sine_pos_embed,
 )
 from detrex.utils import inverse_sigmoid
-
+from detrex.layers import MLP, box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 
 class DabDeformableDetrTransformerEncoder(TransformerLayerSequence):
     def __init__(
@@ -83,7 +84,7 @@ class DabDeformableDetrTransformerEncoder(TransformerLayerSequence):
         **kwargs,
     ):
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             query = layer(
                 query,
                 key,
@@ -92,6 +93,7 @@ class DabDeformableDetrTransformerEncoder(TransformerLayerSequence):
                 attn_masks=attn_masks,
                 query_key_padding_mask=query_key_padding_mask,
                 key_padding_mask=key_padding_mask,
+                layer_index=i,
                 **kwargs,
             )
 
@@ -239,6 +241,7 @@ class DabDeformableDetrTransformer(nn.Module):
         as_two_stage=False,
         num_feature_levels=4,
         two_stage_num_proposals=300,
+        topK=20,
     ):
         super(DabDeformableDetrTransformer, self).__init__()
         self.encoder = encoder
@@ -249,12 +252,14 @@ class DabDeformableDetrTransformer(nn.Module):
 
         self.embed_dim = self.encoder.embed_dim
 
+        # scale-level embedding
+        # 对 4 个多尺度特征层每层附加一个 256 维的 embedding
         self.level_embeds = nn.Parameter(torch.Tensor(self.num_feature_levels, self.embed_dim))
 
-        if self.as_two_stage:
-            self.enc_output = nn.Linear(self.embed_dim, self.embed_dim)
-            self.enc_output_norm = nn.LayerNorm(self.embed_dim)
-
+        # if self.as_two_stage:
+        self.enc_output = nn.Linear(self.embed_dim, self.embed_dim)
+        self.enc_output_norm = nn.LayerNorm(self.embed_dim)
+        self.topK = topK
         self.init_weights()
 
     def init_weights(self):
@@ -306,7 +311,7 @@ class DabDeformableDetrTransformer(nn.Module):
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
-        """Get the reference points used in decoder.
+        """Get the reference points used in encoder and decoder.
 
         Args:
             spatial_shapes (Tensor): The shape of all
@@ -328,9 +333,10 @@ class DabDeformableDetrTransformer(nn.Module):
                 torch.linspace(0.5, H - 0.5, H, dtype=torch.float32, device=device),
                 torch.linspace(0.5, W - 0.5, W, dtype=torch.float32, device=device),
             )
-            ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H)
-            ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W)
-            ref = torch.stack((ref_x, ref_y), -1)
+            # 将各层特征图每个特征点中心坐标根据特征图非 padding 的边长进行归一化
+            ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H)   # (1, HW) / (bs, 1)
+            ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W)   # (1, HW) / (bs, 1)
+            ref = torch.stack((ref_x, ref_y), -1)                                   # (bs, HW, 2)
             reference_points_list.append(ref)
         reference_points = torch.cat(reference_points_list, 1)
         reference_points = reference_points[:, :, None] * valid_ratios[:, None]
@@ -346,12 +352,46 @@ class DabDeformableDetrTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
+    def nms(self, bboxes, scores, threshold=0.5):
+        x1 = bboxes[:, 0]
+        y1 = bboxes[:, 1]
+        x2 = bboxes[:, 2]
+        y2 = bboxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)  # [N,] 每个bbox的面积
+        _, order = scores.sort(0, descending=True)  # 降序排列
+
+        keep = []
+        while order.numel() > 0:  # torch.numel()返回张量元素个数
+            if order.numel() == 1:  # 保留框只剩一个
+                i = order.item()
+                keep.append(i)
+                break
+            else:
+                i = order[0].item()  # 保留scores最大的那个框box[i]
+                keep.append(i)
+
+            # 计算box[i]与其余各框的IOU
+            xx1 = x1[order[1:]].clamp(min=x1[i])  # [N-1,]
+            yy1 = y1[order[1:]].clamp(min=y1[i])
+            xx2 = x2[order[1:]].clamp(max=x2[i])
+            yy2 = y2[order[1:]].clamp(max=y2[i])
+            inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)  # [N-1,]
+
+            iou = inter / (areas[i] + areas[order[1:]] - inter)  # [N-1,]
+            idx = (iou <= threshold).nonzero().squeeze()  # 注意此时idx为[N-1,] 而order为[N,]
+            if idx.numel() == 0:
+                break
+            order = order[idx + 1]  # 修补索引之间的差值
+        return torch.LongTensor(keep)  # Pytorch的索引值为LongTensor
+
+
     def forward(
         self,
         multi_level_feats,
         multi_level_masks,
         multi_level_pos_embeds,
         query_embed,
+        WH,                         # (bs, 4) 第二维是图片预处理后的 [W, H, W, H]
         **kwargs,
     ):
         feat_flatten = []
@@ -365,10 +405,11 @@ class DabDeformableDetrTransformer(nn.Module):
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
 
-            feat = feat.flatten(2).transpose(1, 2)  # bs, hw, c
-            mask = mask.flatten(1)
-            pos_embed = pos_embed.flatten(2).transpose(1, 2)  # bs, hw, c
-            lvl_pos_embed = pos_embed + self.level_embeds[lvl].view(1, 1, -1)
+            feat = feat.flatten(2).transpose(1, 2)  # 从 (bs, c, h, w) 变为 (bs, hw, c)
+            mask = mask.flatten(1)                  # 从 (bs, h, w) 变为 (bs, hw)
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)  # 从 (bs, c, h, w) 变为 (bs, hw, c)
+            # pos_embed 只能够区分 h,w 位置，无法区分不同特征层上坐标相同的特征点，附加 scale-level embedding 信息，区分所有特征点
+            lvl_pos_embed = pos_embed + self.level_embeds[lvl].view(1, 1, -1) # (bs, hw, c) + (1, 1, 256) , c=256
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             feat_flatten.append(feat)
             mask_flatten.append(mask)
@@ -401,41 +442,77 @@ class DabDeformableDetrTransformer(nn.Module):
         )
 
         bs, _, c = memory.shape
-        if self.as_two_stage:
-            assert query_embed is None, "query_embed should be None in two-stage"
-            output_memory, output_proposals = self.gen_encoder_output_proposals(
-                memory, mask_flatten, spatial_shapes
-            )
-            # output_memory: bs, num_tokens, c
-            # output_proposals: bs, num_tokens, 4. unsigmoided.
-            # output_proposals: bs, num_tokens, 4
+        # if self.as_two_stage:
+        # assert query_embed is None, "query_embed should be None in two-stage"
+        output_memory, output_proposals = self.gen_encoder_output_proposals(
+            memory, mask_flatten, spatial_shapes
+        )
+        # output_memory: bs, num_tokens, c
+        # output_proposals: bs, num_tokens, 4. unsigmoided.
+        # output_proposals: bs, num_tokens, 4
 
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
-            enc_outputs_coord_unact = (
-                self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
-            )  # unsigmoided.
+        # 对encoder得到的编码特征memory进行分类预测，对应proposals的分类结果（多分类）
+        enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory) # (bs, sum(spatial_shapes[i,0]*spatial_shapes[i,1]), c=80)
 
-            topk = self.two_stage_num_proposals
-            topk_proposals = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1]
+        # 对encoder得到的编码特征memory进行回归预测，得到相对于proposals(xywh)的偏移量，然后和proposals相加，得到预测的proposals
+        enc_outputs_coord_unact = (
+            self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
+        )  # unsigmoided.  (bs, sum(spatial_shapes[i,0]*spatial_shapes[i,1]), 4)
 
-            # extract region proposal boxes
-            topk_coords_unact = torch.gather(
-                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
-            )  # unsigmoided.
-            reference_points = topk_coords_unact.detach().sigmoid()
-            init_reference_out = reference_points
+        # TODO: NMS 去重 (先去重再取 topK)
 
-            # extract region features
-            target_unact = torch.gather(
-                output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
-            )
-            target = target_unact.detach()
-        else:
-            reference_points = query_embed[..., self.embed_dim :].sigmoid()
-            target = query_embed[..., : self.embed_dim]
-            target = target.unsqueeze(0).expand(bs, -1, -1)
-            init_reference_out = reference_points
-            # (300, 4)
+        # 取 topK 的预测 proposals 作为 decoder 的输入（这里是取了类别可能性最大的 topK 个）
+        # topk = self.two_stage_num_proposals
+        topk = self.topK
+        # max(-1) 按 enc_outputs_class 的最后一维 （80）取最大，[0] 返回最大值的每个数
+        # torch.topK()[1] 返回元素在原数组中的下标, dim=1 在第一维上排序
+        topk_proposals = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1]
+        # 预测 proposals 对应的类别
+        topK_class = torch.topk(enc_outputs_class.max(-1)[1], topk, dim=1)[0]
+
+        # extract region proposal boxes 取出 topK 得分最高对应的预测 bbox (bs, topK, 4)
+        topk_coords_unact = torch.gather(
+            enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+        )  # unsigmoided.
+
+        # 取消梯度，归一化，在2-stage中这个结果会送到 decoder 中作为初始的 bbox
+        reference_points_2stage = topk_coords_unact.detach().sigmoid()
+
+        # TODO: NMS 去重 (先取 topK 再去重)
+        reference_points_2stage_afternms = []
+        scores = enc_outputs_class.max(-1)[0]  # (bs, sum(spatial_shapes[i,0]*spatial_shapes[i,1]))
+        topK_scores = torch.gather(
+            scores, 1, topk_proposals
+        )
+        for b in range(bs):
+            score = topK_scores[b]
+            bbox = reference_points_2stage[b]
+            wh = WH[b]
+            boxes_xyxy = np.array([[(int)(x * y) for x, y in zip(box_cxcywh_to_xyxy(box).cpu().numpy(), wh)] for box in bbox])
+            boxes_xyxy = torch.from_numpy(boxes_xyxy).cuda()
+            idx = self.nms(boxes_xyxy, score, 0.5).cuda()
+            reference_points_2stage_nms = torch.index_select(reference_points_2stage[b], 0, idx)
+            reference_points_2stage_afternms.append(reference_points_2stage_nms)
+
+        ref_length = len(reference_points_2stage_afternms[0])
+        for row in reference_points_2stage_afternms:
+            ref_length = min(ref_length, len(row))
+        reference_points_2stage_afternms = [row[:ref_length] for row in reference_points_2stage_afternms]
+        reference_points_2stage_afternms = torch.stack(reference_points_2stage_afternms)
+        init_reference_out_2stage = reference_points_2stage_afternms
+
+        # extract region features 生成decoder对应的query(target)
+        target_unact = torch.gather(
+            output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
+        )
+        target_2stage = target_unact.detach()
+
+        # 1-stage
+        reference_points = query_embed[..., self.embed_dim :].sigmoid()
+        target = query_embed[..., : self.embed_dim]
+        target = target.unsqueeze(0).expand(bs, -1, -1)
+        init_reference_out = reference_points
+        # (300, 4)
 
         # decoder
         inter_states, inter_references = self.decoder(
@@ -460,4 +537,4 @@ class DabDeformableDetrTransformer(nn.Module):
                 target_unact,
                 topk_coords_unact.sigmoid(),
             )
-        return inter_states, init_reference_out, inter_references_out, None, None
+        return inter_states, init_reference_out, inter_references_out, None, None, reference_points_2stage_afternms

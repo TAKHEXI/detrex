@@ -22,6 +22,7 @@
 # https://github.com/fundamentalvision/Deformable-DETR/blob/main/models/ops/modules/ms_deform_attn.py
 # https://github.com/open-mmlab/mmcv/blob/master/mmcv/ops/multi_scale_deform_attn.py
 # ------------------------------------------------------------------------------------------------
+import json
 
 import math
 import warnings
@@ -288,6 +289,8 @@ class MultiScaleDeformableAttention(nn.Module):
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], float(0))
         value = value.view(bs, num_value, self.num_heads, -1)
+
+        # 权重和偏移值
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
         )

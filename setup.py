@@ -230,5 +230,5 @@ if __name__ == "__main__":
         ),
         package_data={"detrex.config": get_detrex_configs()},
         ext_modules=get_extensions(),
-        cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
+        cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension.with_options(use_ninja=False)},
     )

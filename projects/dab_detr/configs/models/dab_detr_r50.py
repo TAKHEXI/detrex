@@ -55,10 +55,12 @@ model = L(DABDETR)(
         num_patterns=0,  # pattern embedding as in Anchor-DETR
     ),
     embed_dim=256,
-    num_classes=80,
+    # num_classes=80,
+    num_classes=4,
     num_queries=300,
     criterion=L(SetCriterion)(
-        num_classes=80,
+        # num_classes=80,
+        num_classes=4,
         matcher=L(HungarianMatcher)(
             cost_class=2.0,
             cost_bbox=5.0,
